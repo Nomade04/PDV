@@ -62,7 +62,7 @@ def inicializar_banco():
     )
     """)
 
-    # Criar tabela itens_venda (NÃO ALTERAR)
+    # Criar tabela itens_venda (ALTERADA: adicionada coluna pbservacoes se desejado e garantida coluna observacao)
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS itens_venda (
         id INT AUTO_INCREMENT PRIMARY KEY,
@@ -71,10 +71,20 @@ def inicializar_banco():
         quantidade INT NOT NULL,
         preco_unitario DECIMAL(10,2),
         subtotal DECIMAL(10,2),
+        pbservacoes TEXT,
         FOREIGN KEY (venda_id) REFERENCES vendas(id),
         FOREIGN KEY (produto_id) REFERENCES produtos(id)
     )
     """)
+
+    # Garantir que exista a coluna 'observacao' que o interface.py procura
+    cursor.execute("""
+    SELECT COUNT(*) FROM INFORMATION_SCHEMA.COLUMNS
+    WHERE TABLE_SCHEMA = 'sistema_vendas' AND TABLE_NAME = 'itens_venda' AND COLUMN_NAME = 'observacao'
+    """)
+    if cursor.fetchone()[0] == 0:
+        # adiciona a coluna observacao sem remover nada existente
+        cursor.execute("ALTER TABLE itens_venda ADD COLUMN observacao TEXT")
 
     # --- Novas tabelas sugeridas (adicionadas sem alterar as existentes) ---
 
@@ -185,7 +195,3 @@ def inicializar_banco():
     conexao.commit()
     cursor.close()
     conexao.close()
-
-
-
-
