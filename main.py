@@ -2,6 +2,7 @@
 from database import inicializar_banco
 from interface import iniciar_interface
 
+
 def main():
     print("Iniciando sistema...")
     inicializar_banco()  # Cria banco e tabelas automaticamente
