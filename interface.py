@@ -4,12 +4,225 @@ from tkinter import ttk, messagebox
 import mysql.connector
 from datetime import datetime, date
 import math
+import unicodedata
 import vendas_interface
 
 
 # Cores do tema
 COR_PRIMARIA = "#FFA500"
 COR_SECUNDARIA = "#FFD700"
+
+# ---------------------------------------------------------------------------
+# IMPRESSÃO TÉRMICA — Epson TM-T20X via driver Windows (win32print)
+# Usa o driver nativo do Windows "Suporte de impressão USB" — sem libusb.
+# Instale com:  pip install pywin32
+# ---------------------------------------------------------------------------
+
+# Nome da impressora conforme aparece no Windows (Painel de Controle > Dispositivos)
+# Altere se o nome no seu Windows for diferente.
+NOME_IMPRESSORA_WINDOWS = "EPSON TM-T20X"
+
+LARGURA_CUPOM = 48  # colunas para papel 80mm
+
+
+def _linha(char="-"):
+    return char * LARGURA_CUPOM
+
+
+def _col2(esq, dir_, largura=LARGURA_CUPOM):
+    espaco = largura - len(esq) - len(dir_)
+    if espaco < 1:
+        espaco = 1
+    return esq + " " * espaco + dir_
+
+
+def _montar_cupom(venda_id, itens, pagamentos_map, total_a_pagar,
+                  total_pago, cliente_nome=None, payment_types=None):
+    """
+    Monta o conteúdo do cupom como bytes ESC/POS puros para envio via win32print.
+    Retorna bytes prontos para impressão.
+    """
+    ESC = b'\x1b'
+    GS  = b'\x1d'
+
+    def esc(cmd):
+        return ESC + cmd
+
+    # Comandos ESC/POS básicos
+    INIT          = esc(b'@')                    # inicializa impressora
+    BOLD_ON       = esc(b'E\x01')
+    BOLD_OFF      = esc(b'E\x00')
+    ALIGN_CENTER  = esc(b'a\x01')
+    ALIGN_LEFT    = esc(b'a\x00')
+    DOUBLE_ON     = GS + b'!\x11'               # dupla altura + largura
+    DOUBLE_OFF    = GS + b'!\x00'
+    CUT           = GS + b'V\x41\x03'           # corte parcial com avanço
+    LF            = b'\n'
+
+    def txt(s):
+        """Converte string para bytes CP850 (compatível com impressoras térmicas)."""
+        return s.encode("cp850", errors="replace")
+
+    now = datetime.now()
+    buf = bytearray()
+
+    buf += INIT
+    buf += ALIGN_CENTER
+    buf += DOUBLE_ON
+    buf += BOLD_ON
+    buf += txt("SISTEMA PDV\n")
+    buf += DOUBLE_OFF
+    buf += BOLD_OFF
+    buf += txt("Cupom de Venda".center(LARGURA_CUPOM) + "\n")
+    buf += txt(_linha() + "\n")
+
+    buf += ALIGN_LEFT
+    buf += txt(f"Venda N: {venda_id}\n")
+    buf += txt(f"Data  : {now.strftime('%d/%m/%Y %H:%M:%S')}\n")
+    if cliente_nome:
+        buf += txt(f"Cliente: {cliente_nome[:38]}\n")
+    buf += txt(_linha() + "\n")
+
+    # Cabeçalho dos itens
+    buf += BOLD_ON
+    buf += txt(_col2("DESCRICAO", "QTD   UNIT    TOTAL") + "\n")
+    buf += BOLD_OFF
+    buf += txt(_linha() + "\n")
+
+    for it in itens:
+        nome = str(it["descricao"])[:LARGURA_CUPOM]
+        qtd  = it["quantidade"]
+        pu   = it["preco_unit"]
+        sub  = it["subtotal"]
+
+        buf += txt(nome + "\n")
+
+        if isinstance(qtd, float) and not qtd.is_integer():
+            qtd_str = f"{qtd:.3f}".rstrip("0").rstrip(".")
+        else:
+            qtd_str = str(int(qtd))
+
+        linha_val = f"  {qtd_str} x{pu:>7.2f} ={sub:>8.2f}"
+        buf += txt(linha_val + "\n")
+
+        if it.get("observacao"):
+            obs_c = str(it["observacao"])[: LARGURA_CUPOM - 4]
+            buf += txt(f"  * {obs_c}\n")
+
+    buf += txt(_linha() + "\n")
+
+    # Total
+    buf += BOLD_ON
+    buf += txt(_col2("TOTAL", f"R$ {total_a_pagar:.2f}") + "\n")
+    buf += BOLD_OFF
+    buf += txt(_linha("-") + "\n")
+
+    # Pagamentos
+    buf += BOLD_ON
+    buf += txt("PAGAMENTOS:\n")
+    buf += BOLD_OFF
+
+    for forma_id, data in pagamentos_map.items():
+        if payment_types and (forma_id - 1) < len(payment_types):
+            nome_forma = payment_types[forma_id - 1][0]
+        else:
+            nome_forma = f"Forma {forma_id}"
+        buf += txt(_col2(f"  {nome_forma}", f"R$ {data['valor']:.2f}") + "\n")
+
+    buf += txt(_linha("-") + "\n")
+    troco_total = max(0.0, total_pago - total_a_pagar)
+    buf += BOLD_ON
+    buf += txt(_col2("TROCO", f"R$ {troco_total:.2f}") + "\n")
+    buf += BOLD_OFF
+
+    # Rodapé
+    buf += txt(_linha() + "\n")
+    buf += ALIGN_CENTER
+    buf += txt("Obrigado pela preferencia!\n")
+    buf += txt(f"Venda N {venda_id} - {now.strftime('%d/%m/%Y')}\n")
+    buf += txt(_linha() + "\n")
+
+    # Avança papel e corta
+    buf += b'\n' * 4
+    buf += CUT
+
+    return bytes(buf)
+
+
+def imprimir_cupom_thermal(venda_id, itens, pagamentos_map, total_a_pagar,
+                            total_pago, cliente_nome=None, payment_types=None):
+    """
+    Envia cupom ESC/POS para a impressora via win32print (driver Windows nativo).
+    Não depende de libusb — funciona com 'Suporte de impressão USB' da Microsoft.
+    """
+    try:
+        import win32print
+    except ImportError:
+        import tkinter.messagebox as _mb
+        _mb.showwarning(
+            "Impressão",
+            "Biblioteca pywin32 não encontrada.\n"
+            "Instale com:  pip install pywin32\n\n"
+            "A venda foi salva normalmente."
+        )
+        return
+
+    # Tenta encontrar a impressora pelo nome configurado;
+    # se não achar, usa a impressora padrão do Windows como fallback.
+    nome_impressora = NOME_IMPRESSORA_WINDOWS
+    impressoras_instaladas = [p[2] for p in win32print.EnumPrinters(
+        win32print.PRINTER_ENUM_LOCAL | win32print.PRINTER_ENUM_CONNECTIONS
+    )]
+
+    # Busca flexível: aceita se o nome configurado estiver contido no nome instalado
+    match = None
+    for p_name in impressoras_instaladas:
+        if NOME_IMPRESSORA_WINDOWS.upper() in p_name.upper():
+            match = p_name
+            break
+
+    if match:
+        nome_impressora = match
+    else:
+        # Fallback para impressora padrão
+        nome_impressora = win32print.GetDefaultPrinter()
+        import tkinter.messagebox as _mb
+        resposta = _mb.askyesno(
+            "Impressora não encontrada",
+            f"Impressora '{NOME_IMPRESSORA_WINDOWS}' não encontrada.\n"
+            f"Deseja imprimir na impressora padrão?\n({nome_impressora})"
+        )
+        if not resposta:
+            return
+
+    cupom_bytes = _montar_cupom(
+        venda_id=venda_id,
+        itens=itens,
+        pagamentos_map=pagamentos_map,
+        total_a_pagar=total_a_pagar,
+        total_pago=total_pago,
+        cliente_nome=cliente_nome,
+        payment_types=payment_types,
+    )
+
+    try:
+        hPrinter = win32print.OpenPrinter(nome_impressora)
+        try:
+            hJob = win32print.StartDocPrinter(hPrinter, 1, ("Cupom PDV", None, "RAW"))
+            try:
+                win32print.StartPagePrinter(hPrinter)
+                win32print.WritePrinter(hPrinter, cupom_bytes)
+                win32print.EndPagePrinter(hPrinter)
+            finally:
+                win32print.EndDocPrinter(hPrinter)
+        finally:
+            win32print.ClosePrinter(hPrinter)
+    except Exception as e:
+        import tkinter.messagebox as _mb
+        _mb.showwarning(
+            "Impressão",
+            f"Erro ao imprimir cupom:\n{e}\n\nA venda foi salva normalmente."
+        )
 
 # --- Configuração do banco ---
 DB_CONFIG = {
@@ -160,7 +373,6 @@ def iniciar_interface():
     lbl_pdv_subtotal = ctk.CTkLabel(left_panel, text="R$ 0.00", font=ctk.CTkFont(size=16, weight="bold"))
     lbl_pdv_subtotal.pack(anchor="w", pady=2)
 
-    # actions area: top row with Add and Remove, bottom row with Adjust (requested under the two)
     frame_pdv_actions_top = ctk.CTkFrame(left_panel)
     frame_pdv_actions_top.pack(anchor="w", pady=(12,4))
     btn_pdv_add = ctk.CTkButton(frame_pdv_actions_top, text="Adicionar (Enter)", fg_color=COR_PRIMARIA, width=140)
@@ -170,11 +382,9 @@ def iniciar_interface():
 
     frame_pdv_actions_bottom = ctk.CTkFrame(left_panel)
     frame_pdv_actions_bottom.pack(anchor="w", pady=(4,6))
-    # novo botão: Acréscimo / Desconto (abaixo dos dois) - largura igual aos dois juntos
     btn_pdv_adjust = ctk.CTkButton(frame_pdv_actions_bottom, text="Acréscimo / Desconto", fg_color="#6c757d", width=292)
     btn_pdv_adjust.pack(side="left", padx=6)
 
-    # área para exibir último produto registrado (descrição, preço unitário, qtd e total)
     frame_last = ctk.CTkFrame(left_panel)
     frame_last.pack(fill="x", pady=(8,4))
     lbl_last_desc = ctk.CTkLabel(frame_last, text="Último: -", anchor="w", font=ctk.CTkFont(size=16, weight="bold"))
@@ -196,7 +406,6 @@ def iniciar_interface():
         tree_pdv.column(c, width=120 if c != "Descrição" else 300)
     tree_pdv.pack(fill="both", expand=True, padx=6, pady=6)
 
-    # configurar tags visuais para ajustes
     tree_pdv.tag_configure("aj_acresc", foreground="red")
     tree_pdv.tag_configure("aj_desc", foreground="green")
 
@@ -207,7 +416,6 @@ def iniciar_interface():
     lbl_total_value = ctk.CTkLabel(frame_totais, text="R$ 0.00", font=ctk.CTkFont(size=20, weight="bold"))
     lbl_total_value.pack(side="left")
 
-    # resumo de ajustes no rodapé do PDV (solicitado)
     frame_resumo_ajustes = ctk.CTkFrame(pdv_frame)
     frame_resumo_ajustes.pack(fill="x", padx=8, pady=(4,8))
     lbl_resumo_ajustes = ctk.CTkLabel(frame_resumo_ajustes, text="Ajustes: 0 itens  |  Total: R$ 0.00", anchor="w")
@@ -216,9 +424,7 @@ def iniciar_interface():
     pdv_item_counter = {"value": 0}
     pdv_total = {"value": 0.0}
 
-    # lista de observações de acréscimos/descontos aplicados (será concatenada nas observações da venda)
     ajustes_observacoes = []
-    # mapa item_id -> observacao do ajuste (string) para persistência por item
     observacoes_por_item = {}
     ajustes_summary_total = {"value": 0.0}
     ajustes_summary_count = {"value": 0}
@@ -246,7 +452,6 @@ def iniciar_interface():
     entry_pdv_qtd.bind("<KeyRelease>", lambda e: atualizar_subtotal_visual())
     entry_pdv_preco_unit.bind("<KeyRelease>", lambda e: atualizar_subtotal_visual())
 
-    # --- Restrição de caracteres no campo de código do PDV: não permitir '+' e '-' ---
     def validar_codigo_pdv(new_value):
         if new_value is None:
             return False
@@ -264,7 +469,6 @@ def iniciar_interface():
                 return "break"
         entry_pdv_codigo.bind("<KeyPress>", block_plus_minus)
 
-    # Interpreta entradas com operadores:
     def interpretar_codigo_entrada(texto):
         txt = texto.strip()
         if not txt:
@@ -290,14 +494,6 @@ def iniciar_interface():
         lbl_last_total.configure(text=f"Total:\nR$ {subtotal_display}")
 
     def inserir_produto_no_pdv(produto_row, quantidade, preco_unit_override=None, ajuste_text=None, tag=None):
-        """
-        Insere o produto no tree_pdv.
-        produto_row: tuple retornada por buscar_produto_por_codigo ou buscar_produtos_por_nome (id, codigo, nome, preco_venda, fracionado, custo)
-        quantidade: float
-        preco_unit_override: float ou None
-        ajuste_text: texto descritivo do ajuste (será adicionado às observações)
-        tag: tag para aplicar na linha (visual)
-        """
         codigo_db = None
         nome_db = ""
         preco_venda_db = None
@@ -373,7 +569,6 @@ def iniciar_interface():
         pdv_total["value"] += subtotal
         lbl_total_value.configure(text=f"R$ {pdv_total['value']:.2f}")
 
-        # registrar ajuste nas observações se houver (global e por item)
         if ajuste_text:
             ajustes_observacoes.append(f"Item {item_id} ({codigo_db}): {ajuste_text}")
             observacoes_por_item[item_id] = ajuste_text
@@ -386,17 +581,14 @@ def iniciar_interface():
             ajustes_summary_total["value"] += impacto
             atualizar_resumo_ajustes_label()
 
-        # atualizar último produto exibido
         atualizar_info_ultimo_produto(codigo_db, nome_db, f"{preco_unit:.2f}", qtd_display, f"{subtotal:.2f}")
 
-        # limpa campos de entrada padrão e retorna foco para o campo de código
         entry_pdv_codigo.delete(0, tk.END)
         entry_pdv_qtd.delete(0, tk.END); entry_pdv_qtd.insert(0, "1")
         entry_pdv_preco_unit.delete(0, tk.END); entry_pdv_preco_unit.insert(0, "0.00")
         atualizar_subtotal_visual()
         entry_pdv_codigo.focus_set()
 
-    # função que abre popin de ajuste para um produto (pode ser item selecionado ou produto a registrar)
     def abrir_popin_ajuste(produto, quantidade, preco_unit, target_tree_item=None):
         win = ctk.CTkToplevel(app)
         win.title("Acréscimo / Desconto")
@@ -669,7 +861,6 @@ def iniciar_interface():
         win.bind("<Return>", selecionar_e_inserir)
         win.bind("<Escape>", lambda e: cancelar())
 
-    # adicionar item no PDV (tratando códigos, operadores e busca por nome)
     def adicionar_item_pdv(event=None):
         raw = entry_pdv_codigo.get().strip()
         if not raw:
@@ -683,7 +874,6 @@ def iniciar_interface():
             entry_pdv_codigo.focus_set()
             return
 
-        # Se op == '$' => abrir popin de ajuste antes de registrar (pode ser por código ou por busca por nome)
         if op == "$":
             inner_left, inner_code, inner_op = interpretar_codigo_entrada(codigo_busca)
             contains_letter = any(ch.isalpha() for ch in inner_code) if inner_code else False
@@ -964,7 +1154,6 @@ def iniciar_interface():
                 subtotal = float(str(vals[5]).replace(",", "."))
             except Exception:
                 subtotal = 0.0
-            # remover observação por item se existir
             try:
                 item_num = int(vals[0])
                 if item_num in observacoes_por_item:
@@ -976,7 +1165,6 @@ def iniciar_interface():
         lbl_total_value.configure(text=f"R$ {pdv_total['value']:.2f}")
         entry_pdv_codigo.focus_set()
 
-    # bind do botão de ajuste: aplica ao item selecionado se houver, senão abre popin para produto a registrar
     def on_btn_adjust():
         sel = tree_pdv.selection()
         if sel:
@@ -1028,7 +1216,6 @@ def iniciar_interface():
             abrir_popin_ajuste(prod, qtd, preco_base, target_tree_item=None)
 
     btn_pdv_adjust.configure(command=on_btn_adjust)
-
     btn_pdv_add.configure(command=adicionar_item_pdv)
     btn_pdv_remove.configure(command=remover_item_pdv)
     entry_pdv_codigo.bind("<Return>", adicionar_item_pdv)
@@ -1085,16 +1272,15 @@ def iniciar_interface():
         frame_pag = ctk.CTkFrame(frame_final)
         frame_pag.pack(fill="x", padx=12, pady=6)
 
-        # Alterações solicitadas: renomear formas e adicionar PIX 2
         payment_types = [
             ("Dinheiro", "0,00"),
             ("PIX", "0,00"),
             ("Cartão Créd.", "0,00"),
             ("Cartão Déb.", "0,00"),
-            ("Dinheiro 2", "0,00"),   # substitui Cheque
-            ("PIX 2", "0,00"),        # novo
-            ("Debito 2", "0,00"),     # substitui A. Campo1
-            ("Credito 2", "0,00")     # substitui B. Campo2
+            ("Dinheiro 2", "0,00"),
+            ("PIX 2", "0,00"),
+            ("Debito 2", "0,00"),
+            ("Credito 2", "0,00")
         ]
 
         payment_entries = []
@@ -1210,6 +1396,36 @@ def iniciar_interface():
         for e in payment_entries:
             e.bind("<KeyRelease>", lambda ev: recalcular_totais())
 
+        # --- Duplo Enter: preenche o restante no campo focado ---
+        _ultimo_enter = {"time": 0.0, "idx": None}
+
+        def on_enter_pagamento(event, idx):
+            import time
+            agora = time.time()
+            ultimo = _ultimo_enter["time"]
+            ultimo_idx = _ultimo_enter["idx"]
+            if ultimo_idx == idx and (agora - ultimo) < 0.6:
+                # Duplo Enter detectado: preenche restante
+                def to_float(txt):
+                    try:
+                        return float(str(txt).strip().replace(",", ".") or "0")
+                    except Exception:
+                        return 0.0
+                total_pago_atual = sum(to_float(e.get()) for e in payment_entries)
+                restante = total_a_pagar - total_pago_atual
+                if restante > 0:
+                    ent = payment_entries[idx]
+                    val_atual = to_float(ent.get())
+                    novo = val_atual + restante
+                    ent.delete(0, tk.END)
+                    ent.insert(0, f"{novo:.2f}")
+                    recalcular_totais()
+                _ultimo_enter["time"] = 0.0
+                _ultimo_enter["idx"] = None
+            else:
+                _ultimo_enter["time"] = agora
+                _ultimo_enter["idx"] = idx
+
         def get_focus_index():
             focused = app.focus_get()
             for idx, ent in enumerate(payment_entries):
@@ -1261,7 +1477,7 @@ def iniciar_interface():
                 preco_unit_display = str(vals[4])
                 preco_unit = 0.0
                 try:
-                    if " " in preco_unit_display and ( "+" in preco_unit_display or "-" in preco_unit_display):
+                    if " " in preco_unit_display and ("+" in preco_unit_display or "-" in preco_unit_display):
                         parts = preco_unit_display.split()
                         base = float(parts[0].replace(",", "."))
                         sign_delta = parts[1][0]
@@ -1275,7 +1491,6 @@ def iniciar_interface():
                 except Exception:
                     preco_unit = 0.0
                 subtotal = float(str(vals[5]).replace(",", ".") or "0")
-                # pegar observação por item (se existir)
                 item_num = vals[0]
                 obs_item = None
                 try:
@@ -1291,8 +1506,7 @@ def iniciar_interface():
                     "observacao": obs_item
                 })
 
-            # Preparar e agregar pagamentos: somar valores iguais antes de salvar
-            pagamentos_map = {}  # forma_id -> {'valor': float, 'troco': float}
+            pagamentos_map = {}
             for idx, ent in enumerate(payment_entries):
                 txt = ent.get().strip().replace(",", ".")
                 try:
@@ -1301,7 +1515,7 @@ def iniciar_interface():
                     val = 0.0
                 if val <= 0:
                     continue
-                forma_id = idx + 1  # manter a ordem como forma_id (a lógica de mapeamento para ids reais deve ser feita conforme seu BD)
+                forma_id = idx + 1
                 if forma_id not in pagamentos_map:
                     pagamentos_map[forma_id] = {"valor": 0.0, "troco": 0.0}
                 pagamentos_map[forma_id]["valor"] += val
@@ -1317,7 +1531,6 @@ def iniciar_interface():
                     preferred = next(iter(pagamentos_map.keys()))
                 pagamentos_map[preferred]["troco"] += troco_total
 
-            # Inserir em banco com transação
             try:
                 conn = get_connection()
                 cur = conn.cursor()
@@ -1369,7 +1582,6 @@ def iniciar_interface():
                         insert_cols_it.append("preco_unitario"); insert_vals_it.append(preco_to_insert)
                     if "subtotal" in cols_itv:
                         insert_cols_it.append("subtotal"); insert_vals_it.append(subtotal_to_insert)
-                    # incluir observação por item se a coluna existir
                     if "observacao" in cols_itv:
                         insert_cols_it.append("observacao"); insert_vals_it.append(it.get("observacao"))
                     elif "observacoes" in cols_itv:
@@ -1402,7 +1614,6 @@ def iniciar_interface():
                         except Exception:
                             pass
 
-                # Inserir pagamentos agregados (um por forma_id)
                 for forma_id, data in pagamentos_map.items():
                     cur.execute("SHOW COLUMNS FROM pagamentos")
                     cols_pag = [r[0] for r in cur.fetchall()]
@@ -1427,6 +1638,17 @@ def iniciar_interface():
                 cur.close()
                 conn.close()
                 messagebox.showinfo("Venda", f"Venda finalizada e salva. ID: {venda_id}  Total pago: R$ {total_pago:.2f}")
+
+                # --- Impressão térmica ---
+                imprimir_cupom_thermal(
+                    venda_id=venda_id,
+                    itens=itens,
+                    pagamentos_map=pagamentos_map,
+                    total_a_pagar=total_a_pagar,
+                    total_pago=total_pago,
+                    cliente_nome=cliente_nome,
+                    payment_types=payment_types,
+                )
             except Exception as e:
                 try:
                     conn.rollback()
@@ -1454,13 +1676,14 @@ def iniciar_interface():
         frame_final.bind("<Down>", lambda e: focus_next_payment())
         frame_final.bind("<Delete>", lambda e: remover_item_pdv())
 
-        for ent in payment_entries:
+        for i_ent, ent in enumerate(payment_entries):
             ent.bind("<Up>", lambda ev: focus_prev_payment())
             ent.bind("<Down>", lambda ev: focus_next_payment())
             ent.bind("<KeyPress-plus>", lambda ev: finalizar_venda())
             ent.bind("<KeyPress-KP_Add>", lambda ev: finalizar_venda())
             ent.bind("<KeyPress-minus>", lambda ev: voltar_sem_finalizar())
             ent.bind("<KeyPress-KP_Subtract>", lambda ev: voltar_sem_finalizar())
+            ent.bind("<Return>", lambda ev, idx=i_ent: on_enter_pagamento(ev, idx))
 
         show_frame_in_main(frame_final)
         recalcular_totais()
@@ -1647,6 +1870,39 @@ def iniciar_interface():
         btn_salvar.pack(side="left", padx=8)
         btn_voltar.pack(side="left", padx=8)
 
+        # -------------------------------------------------
+        # BARRA DE BUSCA — nova funcionalidade
+        # -------------------------------------------------
+        def normalizar(texto):
+            """Remove acentos e converte para maiúsculas para busca insensível a acentos."""
+            texto = str(texto).upper()
+            return unicodedata.normalize("NFD", texto).encode("ascii", "ignore").decode("ascii")
+
+        frame_busca = ctk.CTkFrame(frame_estoque)
+        frame_busca.pack(fill="x", padx=10, pady=(10, 0))
+
+        ctk.CTkLabel(frame_busca, text="Buscar:").pack(side="left", padx=(6, 4))
+        entry_busca = ctk.CTkEntry(
+            frame_busca,
+            width=380,
+            placeholder_text="Pesquisar por nome ou código do produto..."
+        )
+        entry_busca.pack(side="left", padx=4)
+
+        lbl_busca_resultado = ctk.CTkLabel(frame_busca, text="", text_color="#888888")
+        lbl_busca_resultado.pack(side="left", padx=(8, 4))
+
+        btn_limpar_busca = ctk.CTkButton(
+            frame_busca,
+            text="Limpar",
+            fg_color="#6c757d",
+            hover_color="#5a6268",
+            width=80,
+            command=lambda: (entry_busca.delete(0, tk.END), filtrar_tabela())
+        )
+        btn_limpar_busca.pack(side="left", padx=4)
+        # -------------------------------------------------
+
         colunas = ("Código", "Nome", "Custo", "Lucro (%)", "Sugest.", "Vr. Venda", "Qtd. Mín.", "Qtd. Atual")
         tree = ttk.Treeview(frame_estoque, columns=colunas, show="headings")
         for col in colunas:
@@ -1654,16 +1910,38 @@ def iniciar_interface():
             tree.column(col, width=140)
         tree.pack(fill="both", expand=True, padx=10, pady=10)
 
+        # Cache local de produtos para a busca funcionar sem nova consulta ao BD
+        todos_produtos = []
+
         def atualizar_tabela():
-            for item in tree.get_children():
-                tree.delete(item)
+            todos_produtos.clear()
             try:
                 for p in listar_produtos():
-                    tree.insert("", tk.END, values=p)
+                    todos_produtos.append(p)
             except Exception as e:
                 messagebox.showerror("Erro", f"Falha ao carregar produtos:\n{e}")
+            filtrar_tabela()
 
-        atualizar_tabela()
+        def filtrar_tabela(event=None):
+            termo = normalizar(entry_busca.get().strip())
+            for item in tree.get_children():
+                tree.delete(item)
+            encontrados = 0
+            for p in todos_produtos:
+                codigo = normalizar(p[0])
+                nome = normalizar(p[1])
+                if not termo or termo in codigo or termo in nome:
+                    tree.insert("", tk.END, values=p)
+                    encontrados += 1
+            if termo:
+                lbl_busca_resultado.configure(
+                    text=f"{encontrados} produto(s) encontrado(s)",
+                    text_color="#28a745" if encontrados > 0 else "#d9534f"
+                )
+            else:
+                lbl_busca_resultado.configure(text="")
+
+        entry_busca.bind("<KeyRelease>", filtrar_tabela)
 
         editing_codigo = {"value": None}
 
@@ -1934,9 +2212,10 @@ def iniciar_interface():
 
         frame_cadastro.pack_forget()
         frame_estoque.pack(fill="both", expand=True)
+        atualizar_tabela()
 
     # ---------------------------
-    # Global handlers that check PDV visibility before acting
+    # Global handlers
     # ---------------------------
     def on_global_plus(event=None):
         if pdv_frame.winfo_ismapped():
@@ -2046,5 +2325,3 @@ def iniciar_interface():
         btn.pack(pady=10, fill="x")
 
     app.mainloop()
-
-
