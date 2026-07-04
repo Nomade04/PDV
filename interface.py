@@ -6,6 +6,8 @@ from datetime import datetime, date
 import math
 import unicodedata
 import vendas_interface
+import balanca as _balanca_mod
+import clientes as _clientes_mod
 
 
 # Cores do tema
@@ -60,7 +62,9 @@ def _montar_cupom(venda_id, itens, pagamentos_map, total_a_pagar,
     LF            = b'\n'
 
     def txt(s):
-        """Converte string para bytes CP850 (compatível com impressoras térmicas)."""
+        """Remove acentos e converte para bytes CP850 para evitar erro na impressora."""
+        import unicodedata
+        s = unicodedata.normalize("NFD", str(s)).encode("ascii", "ignore").decode("ascii")
         return s.encode("cp850", errors="replace")
 
     now = datetime.now()
@@ -70,9 +74,13 @@ def _montar_cupom(venda_id, itens, pagamentos_map, total_a_pagar,
     buf += ALIGN_CENTER
     buf += DOUBLE_ON
     buf += BOLD_ON
-    buf += txt("SISTEMA PDV\n")
+    buf += txt("Mercearia Godoi\n")
     buf += DOUBLE_OFF
     buf += BOLD_OFF
+    buf += txt("Rua: Antonia Rosa de Melo Bolanho, 40\n".center(LARGURA_CUPOM) + "\n")
+    buf += txt("Jd. Nova Biritiba - Biritiba Mirim - SP\n".center(LARGURA_CUPOM) + "\n")
+    buf += txt("Telefone: (11) 97147-4599\n".center(LARGURA_CUPOM) + "\n")
+    buf += txt(_linha() + "\n")
     buf += txt("Cupom de Venda".center(LARGURA_CUPOM) + "\n")
     buf += txt(_linha() + "\n")
 
@@ -548,13 +556,14 @@ def iniciar_interface():
 
         pdv_item_counter["value"] += 1
         item_id = pdv_item_counter["value"]
-        if fracionado_db:
-            qtd_display = f"{quantidade:.6f}".rstrip('0').rstrip('.')
-        else:
-            try:
-                qtd_display = f"{int(quantidade)}"
-            except Exception:
+        # Exibe decimais sempre que a quantidade não for inteira (fracionado ou não)
+        try:
+            if fracionado_db or (quantidade != int(quantidade)):
                 qtd_display = f"{quantidade:.6f}".rstrip('0').rstrip('.')
+            else:
+                qtd_display = f"{int(quantidade)}"
+        except Exception:
+            qtd_display = f"{quantidade:.6f}".rstrip('0').rstrip('.')
 
         preco_display = f"{preco_unit:.2f}"
         if ajuste_text:
@@ -1280,8 +1289,119 @@ def iniciar_interface():
             ("Dinheiro 2", "0,00"),
             ("PIX 2", "0,00"),
             ("Debito 2", "0,00"),
-            ("Credito 2", "0,00")
+            ("Credito 2", "0,00"),
+            ("A Prazo", "0,00"),
         ]
+
+        # --- Seleção de cliente para A Prazo ---
+        _cliente_prazo = {"id": None, "nome": None}
+        frame_prazo_cliente = ctk.CTkFrame(frame_final)
+        frame_prazo_cliente.pack(fill="x", padx=12, pady=(0,4))
+        lbl_prazo_info = ctk.CTkLabel(frame_prazo_cliente,
+            text="A Prazo: nenhum cliente vinculado", text_color="#888888")
+        lbl_prazo_info.pack(side="left", padx=6)
+
+        def selecionar_cliente_prazo(on_fechar=None):
+            win_cli = ctk.CTkToplevel(app)
+            win_cli.title("Selecionar Cliente para A Prazo")
+            win_cli.geometry("520x400")
+            win_cli.transient(app); win_cli.lift(); win_cli.focus_force()
+            win_cli.after(100, win_cli.grab_set)
+
+            ctk.CTkLabel(win_cli, text="Selecione o cliente para A Prazo:",
+                         font=ctk.CTkFont(size=13, weight="bold")).pack(pady=(10,4), padx=10, anchor="w")
+            ent_b = ctk.CTkEntry(win_cli, width=360, placeholder_text="Nome ou telefone...")
+            ent_b.pack(padx=10, pady=(0,6))
+            frame_t = tk.Frame(win_cli); frame_t.pack(fill="both", expand=True, padx=10, pady=4)
+            cols_cc = ("id","nome","telefone","devendo")
+            tc = ttk.Treeview(frame_t, columns=cols_cc, show="headings", height=9)
+            tc.heading("id",       text="ID");      tc.column("id",       width=50,  anchor="center")
+            tc.heading("nome",     text="Nome");    tc.column("nome",     width=200)
+            tc.heading("telefone", text="Telefone");tc.column("telefone", width=110)
+            tc.heading("devendo",  text="Devendo"); tc.column("devendo",  width=90,  anchor="e")
+            sb_tc = ttk.Scrollbar(frame_t, orient="vertical", command=tc.yview)
+            tc.configure(yscrollcommand=sb_tc.set)
+            sb_tc.pack(side="right", fill="y"); tc.pack(fill="both", expand=True)
+
+            _todos_cli = []
+            try:
+                conn = get_connection(); cur = conn.cursor()
+                cur.execute("""
+                    SELECT COUNT(*) FROM information_schema.COLUMNS
+                    WHERE TABLE_SCHEMA=%s AND TABLE_NAME='clientes' AND COLUMN_NAME='ativo'
+                """, (DB_CONFIG["database"],))
+                tem_ativo = cur.fetchone()[0] > 0
+                cur.execute("""
+                    SELECT COUNT(*) FROM information_schema.COLUMNS
+                    WHERE TABLE_SCHEMA=%s AND TABLE_NAME='clientes' AND COLUMN_NAME='telefone'
+                """, (DB_CONFIG["database"],))
+                tem_telefone = cur.fetchone()[0] > 0
+                sel_telefone = "c.telefone" if tem_telefone else "'' AS telefone"
+                where_ativo  = "WHERE c.ativo=1" if tem_ativo else ""
+                cur.execute(f"""
+                    SELECT c.id, c.nome, {sel_telefone},
+                           COALESCE(SUM(vp.valor_total-vp.valor_pago),0)
+                    FROM clientes c
+                    LEFT JOIN vendas_prazo vp ON vp.cliente_id=c.id AND vp.status!='pago'
+                    {where_ativo}
+                    GROUP BY c.id, c.nome ORDER BY c.nome
+                """)
+                _todos_cli.extend(cur.fetchall()); cur.close(); conn.close()
+            except Exception: pass
+
+            def _fill(termo=""):
+                for i in tc.get_children(): tc.delete(i)
+                # Opção "Nenhum" sempre no topo
+                tc.insert("", tk.END, values=(0, "(Nenhum — sem vincular)", "", ""),
+                          tags=("nenhum",))
+                tc.tag_configure("nenhum", foreground="#888888")
+                t = _clientes_mod.normalizar(termo)
+                for r in _todos_cli:
+                    if not t or t in _clientes_mod.normalizar(f"{r[1]} {r[2]}"):
+                        tc.insert("", tk.END, values=(r[0], r[1], r[2], f"R$ {float(r[3]):.2f}"))
+            _fill()
+            ent_b.bind("<KeyRelease>", lambda e: _fill(ent_b.get()))
+
+            def _fechar():
+                if on_fechar: on_fechar()
+                win_cli.destroy()
+
+            def confirmar_cli(event=None):
+                sel = tc.selection()
+                if not sel: return
+                vals = tc.item(sel[0])["values"]
+                if int(vals[0]) == 0:
+                    # Opção Nenhum
+                    _cliente_prazo["id"]   = None
+                    _cliente_prazo["nome"] = None
+                    lbl_prazo_info.configure(
+                        text="A Prazo: sem cliente vinculado",
+                        text_color="#888888")
+                else:
+                    _cliente_prazo["id"]   = int(vals[0])
+                    _cliente_prazo["nome"] = str(vals[1])
+                    lbl_prazo_info.configure(
+                        text=f"A Prazo: {vals[1]} (devendo {vals[3]})",
+                        text_color=COR_PRIMARIA)
+                _fechar()
+
+            frame_bt_cli = ctk.CTkFrame(win_cli, fg_color="transparent")
+            frame_bt_cli.pack(fill="x", padx=10, pady=(0,10))
+            ctk.CTkButton(frame_bt_cli, text="Selecionar (Enter)", fg_color=COR_PRIMARIA,
+                          width=160, command=confirmar_cli).pack(side="left", padx=6)
+            ctk.CTkButton(frame_bt_cli, text="Cancelar (ESC)", fg_color="#6c757d",
+                          width=140, command=_fechar).pack(side="right", padx=6)
+            tc.bind("<Double-1>", confirmar_cli)
+            win_cli.bind("<Return>", confirmar_cli)
+            win_cli.bind("<Escape>", lambda e: _fechar())
+            ent_b.focus_set()
+            # Seleciona "Nenhum" por padrão
+            primeiros = tc.get_children()
+            if primeiros: tc.selection_set(primeiros[0])
+
+        ctk.CTkButton(frame_prazo_cliente, text="Selecionar Cliente",
+                      fg_color="#2d89ef", width=150,
+                      command=selecionar_cliente_prazo).pack(side="left", padx=6)
 
         payment_entries = []
 
@@ -1329,6 +1449,21 @@ def iniciar_interface():
             payment_entries.append(ent)
             ent.bind("<FocusIn>", lambda ev, e=ent, d=default: on_payment_focus_in(e, d))
             ent.bind("<FocusOut>", lambda ev, e=ent, d=default: on_payment_focus_out(e, d))
+
+            # Campo A Prazo (índice 8): auto-abrir seleção de cliente ao começar a digitar
+            if i == 8:
+                _prazo_popup_aberto = {"v": False}
+                def _on_prazo_keyrelease(event, _ent=ent):
+                    try:
+                        val = float(_ent.get().strip().replace(",",".") or "0")
+                    except Exception:
+                        val = 0.0
+                    if val > 0 and not _prazo_popup_aberto["v"]:
+                        if _cliente_prazo["id"] is None:
+                            _prazo_popup_aberto["v"] = True
+                            def _reset_flag(): _prazo_popup_aberto["v"] = False
+                            selecionar_cliente_prazo(on_fechar=_reset_flag)
+                ent.bind("<KeyRelease>", _on_prazo_keyrelease, add="+")
 
         frame_troco = ctk.CTkFrame(frame_final)
         frame_troco.pack(fill="x", padx=12, pady=(8,4))
@@ -1455,8 +1590,36 @@ def iniciar_interface():
                 total_pago = float(total_pago_text.replace(",", "."))
             except Exception:
                 total_pago = 0.0
-            if total_pago < total_a_pagar:
-                if not messagebox.askyesno("Confirmar", "O total pago é menor que o total a pagar. Deseja prosseguir mesmo assim?"):
+
+            # Arredonda para 2 casas para evitar erros de float (ex: 41.54 vs 41.540000001)
+            total_pago    = round(total_pago,    2)
+            total_cobrar  = round(total_a_pagar, 2)
+
+            # Verifica se algum método de pagamento foi informado
+            if total_pago <= 0:
+                messagebox.showerror(
+                    "Pagamento obrigatório",
+                    "Nenhum método de pagamento foi informado!\n"
+                    "Preencha ao menos um campo de pagamento antes de finalizar."
+                )
+                payment_entries[0].focus_set()
+                return
+
+            # Verifica se o total pago cobre o total da venda
+            if total_pago < total_cobrar:
+                faltando = round(total_cobrar - total_pago, 2)
+                # Verifica se o campo A Prazo tem valor (idx 8, forma_id 9)
+                try:
+                    val_prazo = float(payment_entries[8].get().strip().replace(",",".") or "0")
+                except Exception:
+                    val_prazo = 0.0
+                if val_prazo <= 0:
+                    messagebox.showerror(
+                        "Pagamento insuficiente",
+                        f"O valor pago (R$ {total_pago:.2f}) nao cobre o total da venda.\n"
+                        f"Faltam: R$ {faltando:.2f}\n\n"
+                        "Ajuste os valores de pagamento antes de finalizar."
+                    )
                     return
 
             cliente_nome = entry_cliente.get().strip() or None
@@ -1614,7 +1777,29 @@ def iniciar_interface():
                         except Exception:
                             pass
 
+                # Garante que formas de pagamento existam no banco e obtém IDs reais
+                # A Prazo não entra na tabela pagamentos (vai para vendas_prazo)
+                idx_prazo    = len(payment_types) - 1   # índice 8 (base 0)
+                forma_id_prazo_local = idx_prazo + 1    # chave no pagamentos_map = 9
+
+                # Insere formas padrão se não existirem (sem alterar as existentes)
+                formas_padrao = [
+                    (1, "Dinheiro"), (2, "PIX"), (3, "Cartao Credito"), (4, "Cartao Debito"),
+                    (5, "Dinheiro 2"), (6, "PIX 2"), (7, "Debito 2"), (8, "Credito 2"),
+                    (9, "A Prazo"),
+                ]
+                for fid, fnome in formas_padrao:
+                    try:
+                        cur.execute("INSERT IGNORE INTO formas_pagamento (id, nome, ativo) VALUES (%s, %s, 1)",
+                                    (fid, fnome))
+                    except Exception:
+                        pass
+
                 for forma_id, data in pagamentos_map.items():
+                    # A Prazo NÃO entra na tabela pagamentos — vai para vendas_prazo
+                    if forma_id == forma_id_prazo_local:
+                        continue
+
                     cur.execute("SHOW COLUMNS FROM pagamentos")
                     cols_pag = [r[0] for r in cur.fetchall()]
                     insert_cols_p = []
@@ -1637,18 +1822,69 @@ def iniciar_interface():
                 conn.commit()
                 cur.close()
                 conn.close()
+
+                # --- Registrar venda a prazo se o método "A Prazo" foi usado ---
+                idx_prazo = len(payment_types) - 1  # último índice = A Prazo
+                forma_id_prazo = idx_prazo + 1
+                if forma_id_prazo in pagamentos_map and pagamentos_map[forma_id_prazo]["valor"] > 0:
+                    val_prazo = pagamentos_map[forma_id_prazo]["valor"]
+                    cli_id = _cliente_prazo.get("id")
+                    if not cli_id:
+                        messagebox.showwarning("A Prazo",
+                            "Nenhum cliente vinculado para A Prazo.\n"
+                            "A venda foi salva mas o prazo NAO foi registrado.\n"
+                            "Vincule o cliente na proxima venda.")
+                    else:
+                        try:
+                            conn2 = get_connection(); cur2 = conn2.cursor()
+                            _clientes_mod.garantir_tabelas()
+                            cur2.execute("""
+                                INSERT INTO vendas_prazo (cliente_id, venda_id, valor_total, valor_pago, status)
+                                VALUES (%s, %s, %s, 0.00, 'aberto')
+                            """, (cli_id, venda_id, val_prazo))
+                            conn2.commit(); cur2.close(); conn2.close()
+                        except Exception as e:
+                            messagebox.showwarning("A Prazo", f"Venda salva, mas falha ao registrar prazo:\n{e}")
+
                 messagebox.showinfo("Venda", f"Venda finalizada e salva. ID: {venda_id}  Total pago: R$ {total_pago:.2f}")
 
-                # --- Impressão térmica ---
-                imprimir_cupom_thermal(
-                    venda_id=venda_id,
-                    itens=itens,
-                    pagamentos_map=pagamentos_map,
-                    total_a_pagar=total_a_pagar,
-                    total_pago=total_pago,
-                    cliente_nome=cliente_nome,
-                    payment_types=payment_types,
-                )
+                # --- Pergunta antes de imprimir (ESC = Não imprimir) ---
+                _imprimir = {"resp": False}
+                _win_imp = ctk.CTkToplevel(app)
+                _win_imp.title("Imprimir")
+                _win_imp.geometry("320x130")
+                _win_imp.transient(app)
+                _win_imp.grab_set()
+                _win_imp.focus_force()
+                _win_imp.resizable(False, False)
+                ctk.CTkLabel(_win_imp, text="Deseja imprimir o cupom?",
+                             font=ctk.CTkFont(size=14)).pack(pady=(20, 12))
+                _fr_bt = ctk.CTkFrame(_win_imp)
+                _fr_bt.pack()
+                def _sim_imp():
+                    _imprimir["resp"] = True
+                    _win_imp.destroy()
+                def _nao_imp():
+                    _imprimir["resp"] = False
+                    _win_imp.destroy()
+                ctk.CTkButton(_fr_bt, text="Sim", fg_color="#28a745",
+                              width=100, command=_sim_imp).pack(side="left", padx=10)
+                ctk.CTkButton(_fr_bt, text="Não", fg_color="#6c757d",
+                              width=100, command=_nao_imp).pack(side="left", padx=10)
+                _win_imp.bind("<Return>", lambda e: _sim_imp())
+                _win_imp.bind("<Escape>", lambda e: _nao_imp())
+                app.wait_window(_win_imp)
+
+                if _imprimir["resp"]:
+                    imprimir_cupom_thermal(
+                        venda_id=venda_id,
+                        itens=itens,
+                        pagamentos_map=pagamentos_map,
+                        total_a_pagar=total_a_pagar,
+                        total_pago=total_pago,
+                        cliente_nome=cliente_nome,
+                        payment_types=payment_types,
+                    )
             except Exception as e:
                 try:
                     conn.rollback()
@@ -2311,10 +2547,10 @@ def iniciar_interface():
     show_frame_in_main(welcome_frame)
 
     botoes = [
-        ("Clientes", None),
+        ("Clientes", lambda: _clientes_mod.mostrar_clientes_inline(frame_main, show_frame_in_main)),
         ("Estoque", abrir_estoque),
         ("Compras", None),
-        ("Vendas", lambda: vendas_interface.mostrar_vendas(app)),
+        ("Vendas", lambda: vendas_interface.mostrar_vendas_inline(frame_main, show_frame_in_main)),
         ("Caixa", None),
         ("A Pagar", None),
         ("A Receber", None),
@@ -2323,5 +2559,13 @@ def iniciar_interface():
     for texto, comando in botoes:
         btn = ctk.CTkButton(frame_menu, text=texto, fg_color=COR_PRIMARIA, hover_color=COR_SECUNDARIA, command=comando)
         btn.pack(pady=10, fill="x")
+
+    # --- Inicia monitor da balança em background ---
+    _monitor_balanca = _balanca_mod.BalancaMonitor(
+        entry_widget=entry_pdv_codigo,
+        callback_enter_fn=adicionar_item_pdv,
+    )
+    _monitor_balanca.iniciar()
+    app.protocol("WM_DELETE_WINDOW", lambda: (_monitor_balanca.parar(), app.destroy()))
 
     app.mainloop()
