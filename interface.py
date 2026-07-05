@@ -8,6 +8,7 @@ import unicodedata
 import vendas_interface
 import balanca as _balanca_mod
 import clientes as _clientes_mod
+import backup as _backup_mod
 
 
 # Cores do tema
@@ -2547,17 +2548,19 @@ def iniciar_interface():
     show_frame_in_main(welcome_frame)
 
     botoes = [
-        ("Clientes", lambda: _clientes_mod.mostrar_clientes_inline(frame_main, show_frame_in_main)),
-        ("Estoque", abrir_estoque),
-        ("Compras", None),
-        ("Vendas", lambda: vendas_interface.mostrar_vendas_inline(frame_main, show_frame_in_main)),
-        ("Caixa", None),
-        ("A Pagar", None),
-        ("A Receber", None),
-        ("PDV", mostrar_pdv)
+        ("Clientes",    lambda: _clientes_mod.mostrar_clientes_inline(frame_main, show_frame_in_main)),
+        ("Estoque",     abrir_estoque),
+        ("Compras",     None),
+        ("Vendas",      lambda: vendas_interface.mostrar_vendas_inline(frame_main, show_frame_in_main)),
+        ("Caixa",       None),
+        ("A Pagar",     None),
+        ("A Receber",   None),
+        ("Recuperacao", lambda: _backup_mod.mostrar_backup_inline(frame_main, show_frame_in_main)),
+        ("PDV",         mostrar_pdv)
     ]
     for texto, comando in botoes:
-        btn = ctk.CTkButton(frame_menu, text=texto, fg_color=COR_PRIMARIA, hover_color=COR_SECUNDARIA, command=comando)
+        btn = ctk.CTkButton(frame_menu, text=texto, fg_color=COR_PRIMARIA,
+                            hover_color=COR_SECUNDARIA, command=comando)
         btn.pack(pady=10, fill="x")
 
     # --- Inicia monitor da balança em background ---
@@ -2566,6 +2569,12 @@ def iniciar_interface():
         callback_enter_fn=adicionar_item_pdv,
     )
     _monitor_balanca.iniciar()
-    app.protocol("WM_DELETE_WINDOW", lambda: (_monitor_balanca.parar(), app.destroy()))
+
+    def _ao_fechar():
+        _monitor_balanca.parar()
+        _backup_mod.parar_backup_automatico()
+        app.destroy()
+
+    app.protocol("WM_DELETE_WINDOW", _ao_fechar)
 
     app.mainloop()
