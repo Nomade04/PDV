@@ -9,6 +9,7 @@ import vendas_interface
 import balanca as _balanca_mod
 import clientes as _clientes_mod
 import backup as _backup_mod
+import updater as _updater_mod
 
 
 # Cores do tema
@@ -2576,5 +2577,8 @@ def iniciar_interface():
         app.destroy()
 
     app.protocol("WM_DELETE_WINDOW", _ao_fechar)
+
+    # Verifica atualizações em background (não trava a interface)
+    _updater_mod.verificar_atualizacao_em_background(app)
 
     app.mainloop()
