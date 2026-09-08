@@ -1840,10 +1840,20 @@ def iniciar_interface():
                         try:
                             conn2 = get_connection(); cur2 = conn2.cursor()
                             _clientes_mod.garantir_tabelas()
+                            # Busca dia de vencimento do cliente
                             cur2.execute("""
-                                INSERT INTO vendas_prazo (cliente_id, venda_id, valor_total, valor_pago, status)
-                                VALUES (%s, %s, %s, 0.00, 'aberto')
-                            """, (cli_id, venda_id, val_prazo))
+                                SELECT dia_vencimento FROM clientes WHERE id=%s
+                            """, (cli_id,))
+                            row_cli = cur2.fetchone()
+                            dia_venc = row_cli[0] if row_cli and row_cli[0] else None
+                            # Calcula data de vencimento
+                            from datetime import date
+                            data_venc = _clientes_mod.calcular_vencimento(date.today(), dia_venc)
+                            cur2.execute("""
+                                INSERT INTO vendas_prazo
+                                    (cliente_id, venda_id, valor_total, valor_pago, status, data_vencimento)
+                                VALUES (%s, %s, %s, 0.00, 'aberto', %s)
+                            """, (cli_id, venda_id, val_prazo, data_venc))
                             conn2.commit(); cur2.close(); conn2.close()
                         except Exception as e:
                             messagebox.showwarning("A Prazo", f"Venda salva, mas falha ao registrar prazo:\n{e}")

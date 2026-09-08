@@ -1,4 +1,6 @@
 # main.py
+
+
 from database import inicializar_banco
 from interface import iniciar_interface
 import backup as _backup_mod

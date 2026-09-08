@@ -62,12 +62,14 @@ def garantir_tabelas():
             )
         """)
         todas_colunas = [
-            ("ativo",          "BOOLEAN       DEFAULT TRUE"),
-            ("telefone",       "VARCHAR(30)   DEFAULT ''"),
-            ("cpf",            "VARCHAR(20)   DEFAULT NULL"),
-            ("email",          "VARCHAR(100)  DEFAULT NULL"),
-            ("endereco",       "TEXT          DEFAULT NULL"),
-            ("limite_credito", "DECIMAL(12,2) DEFAULT 0.00"),
+            ("ativo",           "BOOLEAN       DEFAULT TRUE"),
+            ("telefone",        "VARCHAR(30)   DEFAULT ''"),
+            ("cpf",             "VARCHAR(20)   DEFAULT NULL"),
+            ("email",           "VARCHAR(100)  DEFAULT NULL"),
+            ("endereco",        "TEXT          DEFAULT NULL"),
+            ("limite_credito",  "DECIMAL(12,2) DEFAULT 0.00"),
+            # Dia do mês de vencimento (1-28). NULL = vence 1 mês após a compra
+            ("dia_vencimento",  "TINYINT       DEFAULT NULL"),
         ]
         cols_atuais = _colunas_existentes(cur, "clientes")
         for col, definicao in todas_colunas:
@@ -76,17 +78,30 @@ def garantir_tabelas():
 
         cur.execute("""
             CREATE TABLE IF NOT EXISTS vendas_prazo (
-                id          INT AUTO_INCREMENT PRIMARY KEY,
-                cliente_id  INT NOT NULL,
-                venda_id    INT NOT NULL,
-                valor_total DECIMAL(12,2) NOT NULL,
-                valor_pago  DECIMAL(12,2) DEFAULT 0.00,
-                status      ENUM('aberto','pago','parcial') DEFAULT 'aberto',
-                criado_em   TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                id            INT AUTO_INCREMENT PRIMARY KEY,
+                cliente_id    INT NOT NULL,
+                venda_id      INT NOT NULL,
+                valor_total   DECIMAL(12,2) NOT NULL,
+                valor_pago    DECIMAL(12,2) DEFAULT 0.00,
+                status        ENUM('aberto','pago','parcial','vencido') DEFAULT 'aberto',
+                criado_em     TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                data_vencimento DATE DEFAULT NULL,
                 FOREIGN KEY (cliente_id) REFERENCES clientes(id),
                 FOREIGN KEY (venda_id)   REFERENCES vendas(id) ON DELETE CASCADE
             )
         """)
+        # Garante coluna data_vencimento se tabela já existia
+        cols_vp = _colunas_existentes(cur, "vendas_prazo")
+        if "data_vencimento" not in cols_vp:
+            cur.execute("ALTER TABLE vendas_prazo ADD COLUMN data_vencimento DATE DEFAULT NULL")
+        # Garante status 'vencido' no ENUM
+        try:
+            cur.execute("""
+                ALTER TABLE vendas_prazo
+                MODIFY COLUMN status ENUM('aberto','pago','parcial','vencido') DEFAULT 'aberto'
+            """)
+        except Exception: pass
+
         cur.execute("""
             CREATE TABLE IF NOT EXISTS pagamentos_prazo (
                 id              INT AUTO_INCREMENT PRIMARY KEY,
@@ -104,8 +119,276 @@ def garantir_tabelas():
 
 
 # ══════════════════════════════════════════════════════════════════════
-#  IMPRESSÃO E PDF
+#  CONFIGURAÇÃO GLOBAL DE TAXAS
 # ══════════════════════════════════════════════════════════════════════
+
+TAXAS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "taxas_prazo.json")
+
+_TAXAS_DEFAULT = {
+    "multa_percentual": 2.0,   # % de multa fixa por atraso
+    "juros_dia":        0.3,   # % ao dia de juros
+}
+
+def ler_taxas() -> dict:
+    """Lê taxas do arquivo JSON. Retorna defaults se não existir."""
+    try:
+        if os.path.exists(TAXAS_FILE):
+            with open(TAXAS_FILE, "r", encoding="utf-8") as f:
+                dados = json.load(f)
+                return {
+                    "multa_percentual": float(dados.get("multa_percentual", _TAXAS_DEFAULT["multa_percentual"])),
+                    "juros_dia":        float(dados.get("juros_dia",        _TAXAS_DEFAULT["juros_dia"])),
+                }
+    except Exception:
+        pass
+    return dict(_TAXAS_DEFAULT)
+
+def salvar_taxas(multa_percentual: float, juros_dia: float) -> None:
+    """Salva taxas no arquivo JSON."""
+    try:
+        with open(TAXAS_FILE, "w", encoding="utf-8") as f:
+            json.dump({"multa_percentual": multa_percentual, "juros_dia": juros_dia},
+                      f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"[clientes] Erro ao salvar taxas: {e}")
+
+# Lê taxas ao importar o módulo (podem ser alteradas pela tela de config)
+_taxas = ler_taxas()
+MULTA_PERCENTUAL = _taxas["multa_percentual"]
+JUROS_DIA        = _taxas["juros_dia"]
+
+def recarregar_taxas():
+    """Recarrega as taxas do arquivo e atualiza as variáveis globais."""
+    global MULTA_PERCENTUAL, JUROS_DIA
+    t = ler_taxas()
+    MULTA_PERCENTUAL = t["multa_percentual"]
+    JUROS_DIA        = t["juros_dia"]
+
+
+def calcular_vencimento(data_compra, dia_vencimento=None):
+    """
+    Calcula a data de vencimento de uma compra.
+    - dia_vencimento: int (1-28) — dia fixo do mês
+    - Se None: vence 1 mês após a compra
+    Regra: compra no dia do vencimento ou após → vence no mês seguinte.
+    """
+    from datetime import date, timedelta
+    import calendar
+
+    if isinstance(data_compra, str):
+        data_compra = datetime.strptime(data_compra[:10], "%Y-%m-%d").date()
+    elif isinstance(data_compra, datetime):
+        data_compra = data_compra.date()
+
+    if dia_vencimento is None:
+        # Vence 1 mês após a compra
+        mes  = data_compra.month + 1 if data_compra.month < 12 else 1
+        ano  = data_compra.year + (1 if data_compra.month == 12 else 0)
+        ultimo_dia = calendar.monthrange(ano, mes)[1]
+        return date(ano, mes, min(data_compra.day, ultimo_dia))
+    else:
+        dia = int(dia_vencimento)
+        # Compras antes do dia de vencimento → vence neste mês
+        if data_compra.day < dia:
+            mes = data_compra.month
+            ano = data_compra.year
+        else:
+            # Compra no dia ou depois → vence no próximo mês
+            mes = data_compra.month + 1 if data_compra.month < 12 else 1
+            ano = data_compra.year + (1 if data_compra.month == 12 else 0)
+        import calendar as cal
+        ultimo_dia = cal.monthrange(ano, mes)[1]
+        return date(ano, mes, min(dia, ultimo_dia))
+
+
+def calcular_multa_juros(valor_original, data_vencimento, data_pagamento=None):
+    """
+    Calcula multa e juros por atraso usando as taxas atuais do arquivo.
+    Retorna (valor_com_encargos, multa, juros, dias_atraso).
+    """
+    from datetime import date
+    if data_pagamento is None:
+        data_pagamento = date.today()
+    if isinstance(data_vencimento, str):
+        data_vencimento = datetime.strptime(data_vencimento[:10], "%Y-%m-%d").date()
+    if isinstance(data_pagamento, str):
+        data_pagamento = datetime.strptime(data_pagamento[:10], "%Y-%m-%d").date()
+
+    dias_atraso = (data_pagamento - data_vencimento).days
+    if dias_atraso <= 0:
+        return float(valor_original), 0.0, 0.0, 0
+
+    # Sempre lê as taxas do arquivo para pegar a configuração mais atual
+    taxas = ler_taxas()
+    multa_pct = taxas["multa_percentual"]
+    juros_pct = taxas["juros_dia"]
+
+    multa = float(valor_original) * (multa_pct / 100)
+    juros = float(valor_original) * (juros_pct / 100) * dias_atraso
+    total = float(valor_original) + multa + juros
+    return round(total, 2), round(multa, 2), round(juros, 2), dias_atraso
+
+
+def atualizar_status_vencimentos():
+    """
+    Percorre vendas_prazo em aberto e marca como 'vencido' as que passaram do vencimento.
+    Chamado automaticamente ao abrir a tela de clientes.
+    """
+    from datetime import date
+    try:
+        conn = get_connection(); cur = conn.cursor()
+        cur.execute("""
+            UPDATE vendas_prazo
+            SET status = 'vencido'
+            WHERE status IN ('aberto','parcial')
+              AND data_vencimento IS NOT NULL
+              AND data_vencimento < %s
+        """, (date.today(),))
+        conn.commit(); cur.close(); conn.close()
+    except Exception as e:
+        print(f"[clientes] Erro ao atualizar vencimentos: {e}")
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  CONTRATO / TERMO DE CIÊNCIA — PDF
+# ══════════════════════════════════════════════════════════════════════
+
+def gerar_contrato_pdf(cliente_nome, cpf, telefone, endereco,
+                        dia_vencimento, limite_credito):
+    """
+    Gera PDF do contrato de compra a prazo para o cliente assinar.
+    """
+    try:
+        from reportlab.pdfgen import canvas as rl_canvas
+        from reportlab.lib.pagesizes import A4
+        from reportlab.lib.units import cm
+    except ImportError:
+        try:
+            import subprocess as sp, sys
+            sp.check_call([sys.executable, "-m", "pip", "install", "reportlab"],
+                          stdout=sp.DEVNULL, stderr=sp.DEVNULL)
+            from reportlab.pdfgen import canvas as rl_canvas
+            from reportlab.lib.pagesizes import A4
+            from reportlab.lib.units import cm
+        except Exception:
+            messagebox.showwarning("PDF", "Instale reportlab:\npip install reportlab")
+            return
+
+    import tempfile
+
+    caminho = os.path.join(
+        tempfile.gettempdir(),
+        f"contrato_{unicodedata.normalize('NFD', cliente_nome).encode('ascii','ignore').decode('ascii').replace(' ','_')}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf"
+    )
+
+    W, H = A4
+    c = rl_canvas.Canvas(caminho, pagesize=A4)
+    M = 2.5 * cm   # margem
+    largura = W - 2 * M
+
+    def linha_h(y):
+        c.setLineWidth(0.5)
+        c.line(M, y, W - M, y)
+
+    def texto(x, y, t, bold=False, size=10):
+        c.setFont("Helvetica-Bold" if bold else "Helvetica", size)
+        c.drawString(x, y, t)
+
+    def paragrafo(x, y, texto_longo, size=9, max_w=None):
+        """Quebra texto em múltiplas linhas."""
+        from reportlab.lib.utils import simpleSplit
+        c.setFont("Helvetica", size)
+        mw = max_w or largura
+        linhas = simpleSplit(texto_longo, "Helvetica", size, mw)
+        for l in linhas:
+            c.drawString(x, y, l)
+            y -= size + 2
+        return y
+
+    now = datetime.now()
+    y = H - M
+
+    # Cabeçalho
+    texto(M, y, "MERCEARIA GODOI", bold=True, size=16); y -= 20
+    texto(M, y, "Rua Antonia Rosa de Melo Bolanho, 40 — Jd. Nova Biritiba — Biritiba Mirim/SP", size=9); y -= 14
+    texto(M, y, "Telefone: (11) 97147-4599", size=9); y -= 18
+    linha_h(y); y -= 14
+
+    texto(M, y, "TERMO DE CIÊNCIA E ACORDO DE COMPRA A PRAZO", bold=True, size=13); y -= 24
+    linha_h(y); y -= 14
+
+    # Dados do cliente
+    texto(M, y, "DADOS DO CLIENTE", bold=True, size=10); y -= 16
+    texto(M, y, f"Nome completo : {cliente_nome}", size=10); y -= 14
+    texto(M, y, f"CPF           : {cpf or 'Não informado'}", size=10); y -= 14
+    texto(M, y, f"Telefone      : {telefone or 'Não informado'}", size=10); y -= 14
+    texto(M, y, f"Endereço      : {endereco or 'Não informado'}", size=10); y -= 18
+    linha_h(y); y -= 14
+
+    # Condições do crédito
+    texto(M, y, "CONDIÇÕES DO CRÉDITO", bold=True, size=10); y -= 16
+    if dia_vencimento:
+        venc_txt = (
+            f"Dia fixo de vencimento: dia {dia_vencimento} de cada mês. "
+            f"Compras realizadas antes do dia {dia_vencimento} vencem no dia {dia_vencimento} do mesmo mês. "
+            f"Compras realizadas no dia {dia_vencimento} ou após vencem no dia {dia_vencimento} do mês seguinte."
+        )
+    else:
+        venc_txt = (
+            "Vencimento individual: cada compra vence automaticamente 30 (trinta) dias "
+            "após a data de realização da compra."
+        )
+    y = paragrafo(M, y, venc_txt, size=9); y -= 8
+
+    if limite_credito and float(limite_credito) > 0:
+        texto(M, y, f"Limite de crédito aprovado: R$ {float(limite_credito):.2f}", size=10); y -= 18
+    linha_h(y); y -= 14
+
+    # Encargos por atraso
+    texto(M, y, "ENCARGOS POR ATRASO NO PAGAMENTO", bold=True, size=10); y -= 16
+    encargos = [
+        f"• Multa por atraso: {MULTA_PERCENTUAL:.0f}% (dois por cento) sobre o valor em aberto, aplicada no primeiro dia de atraso.",
+        f"• Juros moratórios: {JUROS_DIA:.1f}% ao dia (zero vírgula três por cento ao dia) sobre o saldo devedor,",
+        f"  calculados da data de vencimento até a data efetiva do pagamento.",
+        f"• Exemplo: compra de R$ 100,00 com 10 dias de atraso = multa R$ 2,00 + juros R$ 3,00 = total R$ 105,00.",
+    ]
+    for e in encargos:
+        y = paragrafo(M, y, e, size=9); y -= 4
+    y -= 8
+    linha_h(y); y -= 14
+
+    # Cláusulas
+    texto(M, y, "CLÁUSULAS GERAIS", bold=True, size=10); y -= 16
+    clausulas = [
+        "1. O cliente se compromete a honrar os pagamentos nas datas pactuadas.",
+        "2. Em caso de inadimplência superior a 30 dias, o crédito poderá ser suspenso.",
+        "3. Os encargos serão calculados automaticamente pelo sistema e informados no ato do pagamento.",
+        "4. O cliente poderá solicitar extrato de suas compras a qualquer momento no estabelecimento.",
+        "5. Este termo tem validade por prazo indeterminado, podendo ser rescindido por qualquer",
+        "   das partes mediante aviso prévio.",
+        "6. Ao assinar este termo, o cliente declara estar ciente e de acordo com todas as condições",
+        "   aqui estabelecidas.",
+    ]
+    for cl in clausulas:
+        y = paragrafo(M, y, cl, size=9); y -= 4
+    y -= 14
+    linha_h(y); y -= 20
+
+    # Data e assinaturas
+    texto(M, y, f"Biritiba Mirim/SP, {now.strftime('%d de %B de %Y').lower().title()}", size=9); y -= 36
+    linha_h(M + largura * 0.05); c.setFont("Helvetica", 8)
+    c.drawString(M + largura * 0.05, y + 2, "Assinatura do Cliente")
+    c.line(W - M - largura * 0.45, y + 14, W - M - largura * 0.05, y + 14)
+    c.drawString(W - M - largura * 0.45, y + 2, "Mercearia Godoi")
+
+    c.save()
+
+    try:
+        os.startfile(caminho)
+    except Exception:
+        import subprocess as sp
+        sp.Popen(["start", caminho], shell=True)
+
 
 COLS = 48
 
@@ -583,41 +866,83 @@ def abrir_cadastro_cliente(parent, cliente_id=None, on_salvo=None):
             cols = _colunas_existentes(cur, "clientes")
             sel = ", ".join([
                 "nome",
-                "telefone"       if "telefone"       in cols else "'' AS telefone",
-                "cpf"            if "cpf"            in cols else "NULL AS cpf",
-                "email"          if "email"          in cols else "NULL AS email",
-                "endereco"       if "endereco"       in cols else "NULL AS endereco",
-                "limite_credito" if "limite_credito" in cols else "0 AS limite_credito",
+                "telefone"        if "telefone"        in cols else "'' AS telefone",
+                "cpf"             if "cpf"             in cols else "NULL AS cpf",
+                "email"           if "email"           in cols else "NULL AS email",
+                "endereco"        if "endereco"        in cols else "NULL AS endereco",
+                "limite_credito"  if "limite_credito"  in cols else "0 AS limite_credito",
+                "dia_vencimento"  if "dia_vencimento"  in cols else "NULL AS dia_vencimento",
             ])
             cur.execute(f"SELECT {sel} FROM clientes WHERE id=%s", (cliente_id,))
             row = cur.fetchone(); cur.close(); conn.close()
             if row:
                 dados = {"nome":row[0],"telefone":row[1] or "","cpf":row[2] or "",
-                         "email":row[3] or "","endereco":row[4] or "","limite":float(row[5] or 0)}
+                         "email":row[3] or "","endereco":row[4] or "",
+                         "limite":float(row[5] or 0),
+                         "dia_vencimento": str(row[6]) if row[6] else ""}
         except Exception as e:
             messagebox.showerror("Erro", f"Falha ao carregar cliente:\n{e}"); return
 
     win = ctk.CTkToplevel(parent_win)
     win.title("Editar Cliente" if cliente_id else "Novo Cliente")
-    win.geometry("480x420"); win.transient(parent_win); win.lift(); win.focus_force()
+    win.geometry("500x490"); win.transient(parent_win); win.lift(); win.focus_force()
     win.after(100, win.grab_set); win.resizable(False, False)
     ctk.CTkLabel(win, text="Editar Cliente" if cliente_id else "Novo Cliente",
                  font=ctk.CTkFont(size=15, weight="bold")).pack(pady=(14,8), padx=16, anchor="w")
 
     def campo(label, obrigatorio=False):
         fr = ctk.CTkFrame(win, fg_color="transparent"); fr.pack(fill="x", padx=16, pady=3)
-        ctk.CTkLabel(fr, text=label+(" *" if obrigatorio else ""), width=140, anchor="w").pack(side="left")
+        ctk.CTkLabel(fr, text=label+(" *" if obrigatorio else ""), width=160, anchor="w").pack(side="left")
         ent = ctk.CTkEntry(fr, width=280); ent.pack(side="left"); return ent
 
-    ent_nome=campo("Nome completo",True); ent_telefone=campo("Telefone",True)
-    ent_cpf=campo("CPF"); ent_email=campo("E-mail")
-    ent_endereco=campo("Endereco"); ent_limite=campo("Limite de credito (R$)")
+    ent_nome     = campo("Nome completo", True)
+    ent_telefone = campo("Telefone", True)
+    ent_cpf      = campo("CPF")
+    ent_email    = campo("E-mail")
+    ent_endereco = campo("Endereco")
+    ent_limite   = campo("Limite de credito (R$)")
+
+    # Campo dia de vencimento com explicação
+    fr_venc = ctk.CTkFrame(win, fg_color="transparent"); fr_venc.pack(fill="x", padx=16, pady=3)
+    ctk.CTkLabel(fr_venc, text="Dia de vencimento (1-28):", width=160, anchor="w").pack(side="left")
+    ent_dia_venc = ctk.CTkEntry(fr_venc, width=80, placeholder_text="Ex: 6")
+    ent_dia_venc.pack(side="left", padx=(0,8))
+    ctk.CTkLabel(fr_venc, text="(vazio = 30 dias apos compra)",
+                 text_color="#888888", font=ctk.CTkFont(size=10)).pack(side="left")
+
     if dados:
-        ent_nome.insert(0,dados.get("nome","")); ent_telefone.insert(0,dados.get("telefone",""))
-        ent_cpf.insert(0,dados.get("cpf","")); ent_email.insert(0,dados.get("email",""))
-        ent_endereco.insert(0,dados.get("endereco","")); ent_limite.insert(0,f"{dados.get('limite',0):.2f}")
+        ent_nome.insert(0,     dados.get("nome",""))
+        ent_telefone.insert(0, dados.get("telefone",""))
+        ent_cpf.insert(0,      dados.get("cpf",""))
+        ent_email.insert(0,    dados.get("email",""))
+        ent_endereco.insert(0, dados.get("endereco",""))
+        ent_limite.insert(0,   f"{dados.get('limite',0):.2f}")
+        ent_dia_venc.insert(0, dados.get("dia_vencimento",""))
+
     ctk.CTkLabel(win, text="* Campos obrigatorios", text_color="#888888",
                  font=ctk.CTkFont(size=10)).pack(anchor="w", padx=16, pady=(4,0))
+
+    # Botão para gerar contrato PDF
+    def gerar_contrato():
+        nome     = ent_nome.get().strip()
+        cpf      = ent_cpf.get().strip()
+        telefone = ent_telefone.get().strip()
+        endereco = ent_endereco.get().strip()
+        try: dia_v = int(ent_dia_venc.get().strip()) if ent_dia_venc.get().strip() else None
+        except: dia_v = None
+        try: lim = float(ent_limite.get().strip().replace(",",".") or "0")
+        except: lim = 0.0
+        if not nome:
+            messagebox.showwarning("Aviso","Preencha o nome antes de gerar o contrato."); return
+        gerar_contrato_pdf(nome, cpf, telefone, endereco, dia_v, lim)
+
+    frame_contrato = ctk.CTkFrame(win, fg_color="transparent")
+    frame_contrato.pack(fill="x", padx=16, pady=(6,0))
+    ctk.CTkButton(frame_contrato, text="📄 Gerar Contrato PDF",
+                  fg_color="#6c757d", width=200, command=gerar_contrato).pack(side="left")
+    ctk.CTkLabel(frame_contrato, text="Imprima para o cliente assinar",
+                 text_color="#888888", font=ctk.CTkFont(size=10)).pack(side="left", padx=8)
+
     frame_bt = ctk.CTkFrame(win, fg_color="transparent"); frame_bt.pack(fill="x", padx=16, pady=(10,14))
 
     def salvar():
@@ -628,6 +953,16 @@ def abrir_cadastro_cliente(parent, cliente_id=None, on_salvo=None):
         endereco=ent_endereco.get().strip() or None
         try: limite=float(ent_limite.get().strip().replace(",",".") or "0")
         except: limite=0.0
+        # Valida dia de vencimento
+        dia_venc_txt = ent_dia_venc.get().strip()
+        dia_venc = None
+        if dia_venc_txt:
+            try:
+                dia_venc = int(dia_venc_txt)
+                if not (1 <= dia_venc <= 28):
+                    messagebox.showwarning("Aviso","Dia de vencimento deve ser entre 1 e 28."); return
+            except ValueError:
+                messagebox.showwarning("Aviso","Dia de vencimento deve ser um numero inteiro."); return
         try:
             conn=get_connection(); cur=conn.cursor()
             cols=_colunas_existentes(cur,"clientes")
@@ -637,6 +972,7 @@ def abrir_cadastro_cliente(parent, cliente_id=None, on_salvo=None):
                 if "email"          in cols: sets.append("email=%s");          vals.append(email)
                 if "endereco"       in cols: sets.append("endereco=%s");       vals.append(endereco)
                 if "limite_credito" in cols: sets.append("limite_credito=%s"); vals.append(limite)
+                if "dia_vencimento" in cols: sets.append("dia_vencimento=%s"); vals.append(dia_venc)
                 vals.append(cliente_id)
                 cur.execute(f"UPDATE clientes SET {', '.join(sets)} WHERE id=%s", vals)
             else:
@@ -645,6 +981,7 @@ def abrir_cadastro_cliente(parent, cliente_id=None, on_salvo=None):
                 if "email"          in cols: c2.append("email");          v2.append(email)
                 if "endereco"       in cols: c2.append("endereco");       v2.append(endereco)
                 if "limite_credito" in cols: c2.append("limite_credito"); v2.append(limite)
+                if "dia_vencimento" in cols: c2.append("dia_vencimento"); v2.append(dia_venc)
                 ph=", ".join(["%s"]*len(v2))
                 cur.execute(f"INSERT INTO clientes ({', '.join(c2)}) VALUES ({ph})", v2)
             conn.commit(); cur.close(); conn.close()
@@ -666,7 +1003,8 @@ def abrir_pagamento_prazo(parent, cliente_id, cliente_nome, on_pago=None):
         conn=get_connection(); cur=conn.cursor()
         cur.execute("""
             SELECT vp.id, v.id, vp.valor_total, vp.valor_pago,
-                   (vp.valor_total-vp.valor_pago) AS saldo, vp.criado_em, vp.status
+                   (vp.valor_total-vp.valor_pago) AS saldo, vp.criado_em, vp.status,
+                   vp.data_vencimento
             FROM vendas_prazo vp LEFT JOIN vendas v ON v.id=vp.venda_id
             WHERE vp.cliente_id=%s AND vp.status!='pago' ORDER BY vp.criado_em
         """, (cliente_id,))
@@ -676,47 +1014,95 @@ def abrir_pagamento_prazo(parent, cliente_id, cliente_nome, on_pago=None):
     if not dividas:
         messagebox.showinfo("Sem dividas", f"{cliente_nome} nao possui dividas em aberto."); return
 
-    total_devendo=sum(float(d[4]) for d in dividas)
+    from datetime import date as date_cls, timedelta
+    hoje = date_cls.today()
+
+    # Busca dia_vencimento atual do cliente para cálculo retroativo
+    try:
+        conn_dv = get_connection(); cur_dv = conn_dv.cursor()
+        cur_dv.execute("SELECT dia_vencimento FROM clientes WHERE id=%s", (cliente_id,))
+        row_dv = cur_dv.fetchone()
+        dia_venc_cliente = int(row_dv[0]) if row_dv and row_dv[0] else None
+        cur_dv.close(); conn_dv.close()
+    except Exception:
+        dia_venc_cliente = None
+
+    def _encargos(d):
+        vp_id,v_id,total,pago,saldo,criado,status,data_venc = d
+        # Se não tem data_vencimento salva, recalcula com o dia_vencimento atual do cliente
+        if data_venc is None:
+            try:
+                data_criacao = criado.date() if isinstance(criado, datetime) else criado
+                # Se cliente tem dia fixo, usa calcular_vencimento; senão 30 dias
+                data_venc_calc = calcular_vencimento(data_criacao, dia_venc_cliente)
+            except Exception:
+                data_venc_calc = hoje  # fallback seguro
+        else:
+            data_venc_calc = data_venc
+
+        if data_venc_calc < hoje:
+            # calcular_multa_juros sempre lê taxas do arquivo (pega a mais atual)
+            total_c, multa, juros, dias = calcular_multa_juros(float(saldo), data_venc_calc, hoje)
+            return total_c, multa, juros, dias, data_venc_calc
+        return float(saldo), 0.0, 0.0, 0, data_venc_calc
+
+    total_devendo = sum(_encargos(d)[0] for d in dividas)
+
     win=ctk.CTkToplevel(parent_win)
     win.title(f"Pagar Dividas — {cliente_nome}")
-    win.geometry("680x620"); win.transient(parent_win); win.lift(); win.focus_force()
+    win.geometry("760x660"); win.transient(parent_win); win.lift(); win.focus_force()
     win.after(100, win.grab_set)
 
     ctk.CTkLabel(win, text=f"Dividas de {cliente_nome}",
                  font=ctk.CTkFont(size=14, weight="bold")).pack(pady=(12,4), padx=12, anchor="w")
 
     frame_tree=tk.Frame(win); frame_tree.pack(fill="both", expand=True, padx=12, pady=6)
-    cols=("sel","venda","data","total","pago","saldo","status")
+    cols=("sel","venda","vencimento","saldo_orig","multa","juros","total_enc","status")
     tree=ttk.Treeview(frame_tree, columns=cols, show="headings", selectmode="none")
-    tree.heading("sel",   text="");       tree.column("sel",   width=30, anchor="center")
-    tree.heading("venda", text="Venda");  tree.column("venda", width=60, anchor="center")
-    tree.heading("data",  text="Data");   tree.column("data",  width=130)
-    tree.heading("total", text="Total");  tree.column("total", width=85, anchor="e")
-    tree.heading("pago",  text="Pago");   tree.column("pago",  width=85, anchor="e")
-    tree.heading("saldo", text="Saldo");  tree.column("saldo", width=85, anchor="e")
-    tree.heading("status",text="Status"); tree.column("status",width=70, anchor="center")
+    tree.heading("sel",       text="");          tree.column("sel",       width=30,  anchor="center")
+    tree.heading("venda",     text="Venda");     tree.column("venda",     width=55,  anchor="center")
+    tree.heading("vencimento",text="Vencimento");tree.column("vencimento",width=100, anchor="center")
+    tree.heading("saldo_orig",text="Saldo");     tree.column("saldo_orig",width=80,  anchor="e")
+    tree.heading("multa",     text="Multa 2%");  tree.column("multa",     width=75,  anchor="e")
+    tree.heading("juros",     text="Juros");     tree.column("juros",     width=75,  anchor="e")
+    tree.heading("total_enc", text="Total c/enc");tree.column("total_enc",width=90,  anchor="e")
+    tree.heading("status",    text="Status");    tree.column("status",    width=75,  anchor="center")
     sb=ttk.Scrollbar(frame_tree, orient="vertical", command=tree.yview)
     tree.configure(yscrollcommand=sb.set); sb.pack(side="right", fill="y"); tree.pack(fill="both", expand=True)
     tree.tag_configure("selecionado", background="#1a4a1a", foreground="#aaffaa")
+    tree.tag_configure("vencido",     foreground="#ff6666")
 
-    selecionados={}; iids_map={}
+    selecionados={}; iids_map={}; encargos_map={}
     for d in dividas:
-        vp_id,v_id,total,pago,saldo,criado,status=d
-        try: dt_s=criado.strftime("%d/%m/%Y %H:%M") if isinstance(criado,datetime) else str(criado)
-        except: dt_s=str(criado)
-        iid=tree.insert("",tk.END,values=("☐",v_id,dt_s,f"{float(total):.2f}",f"{float(pago):.2f}",f"{float(saldo):.2f}",status))
+        vp_id,v_id,total,pago,saldo,criado,status,data_venc = d
+        total_c, multa, juros, dias, data_venc_calc = _encargos(d)
+        atrasado = data_venc_calc and data_venc_calc < hoje
+        venc_s = data_venc_calc.strftime("%d/%m/%Y") if data_venc_calc else "30 dias"
+        status_s = f"ATRASO {dias}d" if dias > 0 else status
+        tags = ("vencido",) if atrasado else ()
+        iid=tree.insert("",tk.END, values=(
+            "☐", v_id, venc_s,
+            f"{float(saldo):.2f}",
+            f"{multa:.2f}" if multa>0 else "-",
+            f"{juros:.2f}" if juros>0 else "-",
+            f"{total_c:.2f}",
+            status_s
+        ), tags=tags)
         selecionados[iid]=False; iids_map[iid]=d
+        encargos_map[iid]=(total_c, multa, juros, dias, data_venc_calc)
 
-    lbl_sel=ctk.CTkLabel(win, text=f"Total devendo: R$ {total_devendo:.2f}  |  Selecionado: R$ 0,00",
-                          font=ctk.CTkFont(size=12,weight="bold"), text_color=COR_PRIMARIA)
+    lbl_sel=ctk.CTkLabel(win,
+        text=f"Total devendo (c/ encargos): R$ {total_devendo:.2f}  |  Selecionado: R$ 0,00",
+        font=ctk.CTkFont(size=12,weight="bold"), text_color=COR_PRIMARIA)
     lbl_sel.pack(anchor="w", padx=14, pady=(0,2))
 
     def get_total_sel():
-        return sum(float(iids_map[i][4]) for i,s in selecionados.items() if s)
+        return sum(encargos_map[i][0] for i,s in selecionados.items() if s)
 
     def atualizar_sel():
         ts=get_total_sel()
-        lbl_sel.configure(text=f"Total devendo: R$ {total_devendo:.2f}  |  Selecionado: R$ {ts:.2f}")
+        lbl_sel.configure(
+            text=f"Total devendo (c/ encargos): R$ {total_devendo:.2f}  |  Selecionado: R$ {ts:.2f}")
         recalc_totais()
 
     def toggle(event):
@@ -724,7 +1110,13 @@ def abrir_pagamento_prazo(parent, cliente_id, cliente_nome, on_pago=None):
         if not iid: return
         selecionados[iid]=not selecionados[iid]
         vals=list(tree.item(iid)["values"]); vals[0]="✔" if selecionados[iid] else "☐"
-        tree.item(iid, values=vals, tags=("selecionado",) if selecionados[iid] else ())
+        orig_tags = tree.item(iid)["tags"]
+        new_tags = list(orig_tags)
+        if selecionados[iid]:
+            if "selecionado" not in new_tags: new_tags.append("selecionado")
+        else:
+            if "selecionado" in new_tags: new_tags.remove("selecionado")
+        tree.item(iid, values=vals, tags=new_tags)
         atualizar_sel()
     tree.bind("<ButtonRelease-1>", toggle)
 
@@ -732,7 +1124,9 @@ def abrir_pagamento_prazo(parent, cliente_id, cliente_nome, on_pago=None):
         for iid in selecionados:
             selecionados[iid]=True
             vals=list(tree.item(iid)["values"]); vals[0]="✔"
-            tree.item(iid, values=vals, tags=("selecionado",))
+            orig_tags = list(tree.item(iid)["tags"])
+            if "selecionado" not in orig_tags: orig_tags.append("selecionado")
+            tree.item(iid, values=vals, tags=orig_tags)
         atualizar_sel()
 
     # Múltiplas formas de pagamento
@@ -815,7 +1209,7 @@ def abrir_pagamento_prazo(parent, cliente_id, cliente_nome, on_pago=None):
             conn=get_connection(); cur=conn.cursor(); conn.start_transaction()
             rec_rest=recebido
             for d in a_pagar:
-                vp_id,v_id,total,pago_ant,saldo,criado,status=d
+                vp_id,v_id,total,pago_ant,saldo,criado,status,*_ = d
                 pagar_este=min(rec_rest,float(saldo))
                 novo_pago=float(pago_ant)+pagar_este
                 rec_rest=max(0.0,rec_rest-float(saldo))
@@ -881,7 +1275,7 @@ def abrir_gerar_nota(parent, cliente_id, cliente_nome):
 
     selecionados={}; iids_map={}
     for d in vendas_pagas:
-        vp_id,v_id,total,pago,saldo_orig,criado,status=d
+        vp_id,v_id,total,pago,saldo_orig,criado,status,*_ = d
         try: dt_s=criado.strftime("%d/%m/%Y %H:%M") if isinstance(criado,datetime) else str(criado)[:16]
         except: dt_s=str(criado)[:16]
         iid=tree.insert("",tk.END,values=("☐",v_id,dt_s,f"R$ {float(total):.2f}",status))
@@ -992,12 +1386,68 @@ def _construir_tela_clientes(container, parent_win):
     btn_nota     =ctk.CTkButton(frame_botoes, text="Gerar Nota",   fg_color="#2d89ef",    width=110)
     btn_inativar =ctk.CTkButton(frame_botoes, text="Inativar",     fg_color="#d9534f",    width=100)
     btn_atualizar=ctk.CTkButton(frame_botoes, text="Atualizar",    fg_color="#6c757d",    width=100)
+    btn_taxas    =ctk.CTkButton(frame_botoes, text="⚙ Taxas",      fg_color="#555555",    width=90)
     btn_editar.pack(side="left", padx=4, pady=6)
     btn_pagar.pack(side="left", padx=4)
     btn_cobrar.pack(side="left", padx=4)
     btn_nota.pack(side="left", padx=4)
     btn_inativar.pack(side="left", padx=4)
     btn_atualizar.pack(side="left", padx=4)
+    btn_taxas.pack(side="left", padx=4)
+
+    def abrir_config_taxas():
+        """Tela para alterar multa e juros globais."""
+        taxas = ler_taxas()
+        win = ctk.CTkToplevel(parent_win)
+        win.title("Configuracao de Taxas")
+        win.geometry("400x240")
+        win.resizable(False, False)
+        win.transient(parent_win); win.lift(); win.focus_force()
+        win.after(100, win.grab_set)
+
+        ctk.CTkLabel(win, text="Taxas de Atraso (globais)",
+                     font=ctk.CTkFont(size=14, weight="bold")).pack(pady=(16,12))
+
+        fr1 = ctk.CTkFrame(win, fg_color="transparent"); fr1.pack(fill="x", padx=24, pady=4)
+        ctk.CTkLabel(fr1, text="Multa por atraso (%):", width=200, anchor="w").pack(side="left")
+        ent_multa = ctk.CTkEntry(fr1, width=100)
+        ent_multa.insert(0, str(taxas["multa_percentual"]))
+        ent_multa.pack(side="left", padx=8)
+
+        fr2 = ctk.CTkFrame(win, fg_color="transparent"); fr2.pack(fill="x", padx=24, pady=4)
+        ctk.CTkLabel(fr2, text="Juros ao dia (%):", width=200, anchor="w").pack(side="left")
+        ent_juros = ctk.CTkEntry(fr2, width=100)
+        ent_juros.insert(0, str(taxas["juros_dia"]))
+        ent_juros.pack(side="left", padx=8)
+
+        ctk.CTkLabel(win,
+                     text="Alteracoes valem para todos os clientes.\nO contrato PDF sera atualizado automaticamente.",
+                     text_color="#888888", font=ctk.CTkFont(size=10),
+                     justify="center").pack(pady=(8,0))
+
+        frame_bt = ctk.CTkFrame(win, fg_color="transparent"); frame_bt.pack(pady=12)
+
+        def salvar_config():
+            try:
+                m = float(ent_multa.get().strip().replace(",","."))
+                j = float(ent_juros.get().strip().replace(",","."))
+                if m < 0 or j < 0:
+                    messagebox.showwarning("Aviso","As taxas nao podem ser negativas."); return
+            except ValueError:
+                messagebox.showwarning("Aviso","Informe valores numericos validos."); return
+            salvar_taxas(m, j)
+            recarregar_taxas()
+            messagebox.showinfo("Sucesso", f"Taxas atualizadas:\nMulta: {m}%  |  Juros: {j}% ao dia")
+            win.destroy()
+
+        ctk.CTkButton(frame_bt, text="Salvar", fg_color=COR_PRIMARIA,
+                      width=130, command=salvar_config).pack(side="left", padx=8)
+        ctk.CTkButton(frame_bt, text="Cancelar", fg_color="#6c757d",
+                      width=120, command=win.destroy).pack(side="left", padx=8)
+        win.bind("<Return>", lambda e: salvar_config())
+        win.bind("<Escape>", lambda e: win.destroy())
+
+    btn_taxas.configure(command=abrir_config_taxas)
 
     _cliente_sel={"id":None,"nome":None}
     _todos_clientes=[]
@@ -1047,7 +1497,7 @@ def _construir_tela_clientes(container, parent_win):
                 WHERE vp.cliente_id=%s ORDER BY vp.criado_em DESC
             """, (cliente_id,))
             for row in cur.fetchall():
-                vp_id,v_id,total,pago,saldo,dt,status=row
+                vp_id,v_id,total,pago,saldo,dt,status,*_ = row
                 try: dt_s=dt.strftime("%d/%m/%Y %H:%M") if isinstance(dt,datetime) else str(dt)
                 except: dt_s=str(dt)
                 tree_prazo.insert("",tk.END, values=(
@@ -1176,7 +1626,7 @@ def _construir_tela_clientes(container, parent_win):
 
         sel_map={}; iid_map={}
         for d in dividas:
-            vp_id,v_id,total,pago,saldo,criado,status=d
+            vp_id,v_id,total,pago,saldo,criado,status,*_ = d
             try: dt_s=criado.strftime("%d/%m/%Y %H:%M") if isinstance(criado,datetime) else str(criado)[:16]
             except: dt_s=str(criado)[:16]
             iid=tree_c.insert("",tk.END, values=("☐",v_id,dt_s,f"{float(total):.2f}",f"{float(pago):.2f}",f"{float(saldo):.2f}",status))

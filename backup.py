@@ -68,48 +68,82 @@ def _salvar_config(cfg: dict):
 #  LÓGICA DE BACKUP / RESTAURAÇÃO
 # ══════════════════════════════════════════════════════════════════════
 
-def _encontrar_mysqldump():
+def _encontrar_executavel(nome: str) -> str | None:
     """
-    Tenta localizar o executável mysqldump no sistema.
-    Procura no PATH e em locais comuns do Windows/Linux.
+    Localiza um executável MySQL (mysqldump ou mysql) no sistema.
+    Usa shutil.which primeiro, depois busca com glob em locais comuns do Windows.
     """
-    # Tenta pelo PATH primeiro
-    dump = shutil.which("mysqldump")
-    if dump:
-        return dump
+    import glob
 
-    # Locais comuns no Windows
-    candidatos_win = [
-        r"C:\Program Files\MySQL\MySQL Server 8.0\bin\mysqldump.exe",
-        r"C:\Program Files\MySQL\MySQL Server 5.7\bin\mysqldump.exe",
-        r"C:\Program Files (x86)\MySQL\MySQL Server 8.0\bin\mysqldump.exe",
-        r"C:\xampp\mysql\bin\mysqldump.exe",
-        r"C:\wamp64\bin\mysql\mysql8.0\bin\mysqldump.exe",
-        r"C:\laragon\bin\mysql\mysql-8.0\bin\mysqldump.exe",
+    # 1. Tenta pelo PATH
+    encontrado = shutil.which(nome)
+    if encontrado:
+        return encontrado
+
+    exe = nome if nome.endswith(".exe") else nome + ".exe"
+
+    # 2. Busca com glob em locais comuns do Windows (qualquer versão)
+    padroes_win = [
+        rf"C:\Program Files\MySQL\MySQL Server *\bin\{exe}",
+        rf"C:\Program Files (x86)\MySQL\MySQL Server *\bin\{exe}",
+        rf"C:\xampp\mysql\bin\{exe}",
+        rf"C:\wamp\bin\mysql\mysql*\bin\{exe}",
+        rf"C:\wamp64\bin\mysql\mysql*\bin\{exe}",
+        rf"C:\laragon\bin\mysql\mysql-*\bin\{exe}",
+        rf"C:\laragon\bin\mysql\*\bin\{exe}",
+        rf"C:\mysql\bin\{exe}",
+        rf"C:\mysql*\bin\{exe}",
+        # MariaDB (compatível)
+        rf"C:\Program Files\MariaDB *\bin\{exe}",
+        rf"C:\Program Files (x86)\MariaDB *\bin\{exe}",
     ]
-    for c in candidatos_win:
-        if os.path.isfile(c):
-            return c
+
+    for padrao in padroes_win:
+        resultados = glob.glob(padrao)
+        if resultados:
+            # Ordena para pegar a versão mais recente
+            resultados.sort(reverse=True)
+            return resultados[0]
+
+    # 3. Tenta via registro do Windows (silencioso se falhar)
+    try:
+        import winreg
+        chaves = [
+            r"SOFTWARE\MySQL AB",
+            r"SOFTWARE\WOW6432Node\MySQL AB",
+        ]
+        for chave_raiz in chaves:
+            try:
+                with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, chave_raiz) as k:
+                    i = 0
+                    while True:
+                        try:
+                            sub = winreg.EnumKey(k, i)
+                            with winreg.OpenKey(k, sub) as ks:
+                                try:
+                                    loc, _ = winreg.QueryValueEx(ks, "Location")
+                                    candidato = os.path.join(loc, "bin", exe)
+                                    if os.path.isfile(candidato):
+                                        return candidato
+                                except Exception:
+                                    pass
+                            i += 1
+                        except OSError:
+                            break
+            except Exception:
+                pass
+    except ImportError:
+        pass
 
     return None
 
-def _encontrar_mysql():
-    """Localiza o executável mysql (cliente) para restauração."""
-    cli = shutil.which("mysql")
-    if cli:
-        return cli
-    candidatos_win = [
-        r"C:\Program Files\MySQL\MySQL Server 8.0\bin\mysql.exe",
-        r"C:\Program Files\MySQL\MySQL Server 5.7\bin\mysql.exe",
-        r"C:\Program Files (x86)\MySQL\MySQL Server 8.0\bin\mysql.exe",
-        r"C:\xampp\mysql\bin\mysql.exe",
-        r"C:\wamp64\bin\mysql\mysql8.0\bin\mysql.exe",
-        r"C:\laragon\bin\mysql\mysql-8.0\bin\mysql.exe",
-    ]
-    for c in candidatos_win:
-        if os.path.isfile(c):
-            return c
-    return None
+
+def _encontrar_mysqldump() -> str | None:
+    return _encontrar_executavel("mysqldump")
+
+
+def _encontrar_mysql() -> str | None:
+    return _encontrar_executavel("mysql")
 
 
 def executar_backup(pasta_destino: str, prefixo: str = "auto") -> tuple[bool, str]:
@@ -125,9 +159,15 @@ def executar_backup(pasta_destino: str, prefixo: str = "auto") -> tuple[bool, st
     mysqldump = _encontrar_mysqldump()
     if not mysqldump:
         return False, (
-            "mysqldump nao encontrado.\n"
-            "Verifique se o MySQL esta instalado e se o mysqldump esta no PATH.\n"
-            "Caminhos verificados: PATH do sistema e locais comuns do Windows."
+            "mysqldump.exe nao encontrado no sistema.\n\n"
+            "O sistema procurou em:\n"
+            "  • PATH do Windows\n"
+            "  • C:\\Program Files\\MySQL\\MySQL Server *\\bin\\\n"
+            "  • C:\\xampp\\mysql\\bin\\\n"
+            "  • C:\\wamp64\\bin\\mysql\\*\\bin\\\n"
+            "  • C:\\laragon\\bin\\mysql\\*\\bin\\\n\n"
+            "Solução: Adicione a pasta 'bin' do MySQL ao PATH do Windows.\n"
+            "Ex: C:\\Program Files\\MySQL\\MySQL Server 8.0\\bin"
         )
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -209,8 +249,16 @@ def restaurar_backup(caminho_sql_gz: str,
     mysql = _encontrar_mysql()
     if not mysql:
         return False, (
-            "Cliente mysql nao encontrado.\n"
-            "Verifique se o MySQL esta instalado e acessivel pelo PATH."
+            "Cliente 'mysql.exe' nao encontrado no sistema.\n\n"
+            "O sistema procurou em:\n"
+            "  • PATH do Windows\n"
+            "  • C:\\Program Files\\MySQL\\MySQL Server *\\bin\\\n"
+            "  • C:\\xampp\\mysql\\bin\\\n"
+            "  • C:\\wamp64\\bin\\mysql\\*\\bin\\\n"
+            "  • C:\\laragon\\bin\\mysql\\*\\bin\\\n"
+            "  • Registro do Windows\n\n"
+            "Solução: Adicione a pasta 'bin' do MySQL ao PATH do Windows.\n"
+            "Ex: C:\\Program Files\\MySQL\\MySQL Server 8.0\\bin"
         )
 
     if callback_progresso:
